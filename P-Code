@@ -1,0 +1,570 @@
+// ============================================================
+// FILE 1: appsscript.json
+// Go to ⚙️ Project Settings → Show appsscript.json
+// Replace entire content with this:
+// ============================================================
+
+/*
+{
+  "timeZone": "Asia/Kolkata",
+  "dependencies": {
+    "enabledAdvancedServices": [
+      {
+        "userSymbol": "Drive",
+        "version": "v3",
+        "serviceId": "drive"
+      },
+      {
+        "userSymbol": "AdminDirectory",
+        "version": "directory_v1",
+        "serviceId": "admin"
+      }
+    ]
+  },
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/admin.datatransfer",
+    "https://www.googleapis.com/auth/admin.directory.user",
+    "https://www.googleapis.com/auth/admin.directory.user.readonly",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/script.external_request"
+  ],
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8"
+}
+*/
+
+// ============================================================
+// FILE 2: Code.gs  — Multiple Old Owners Support
+// Replace entire Code.gs content with everything below:
+// ============================================================
+
+const SHEET_NAME   = "Transfer Ownership";
+const LOG_SHEET    = "Transfer Log";
+const DRIVE_APP_ID = "55656082996"; // Google Drive fixed Data Transfer App ID
+
+// ─────────────────────────────────────────────
+// CUSTOM MENU
+// ─────────────────────────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("🚀 Admin Transfer")
+    .addItem("⚙️  1. Setup Sheet",                       "setupSheet")
+    .addSeparator()
+    .addItem("🔍  2. Validate All Users",                 "validateAllUsers")
+    .addItem("🔄  3. Transfer All (Bulk)",                "transferAllRows")
+    .addSeparator()
+    .addItem("▶️   Transfer Selected Row Only",           "transferSelectedRow")
+    .addSeparator()
+    .addItem("📋  Check All Transfer Statuses",           "checkAllStatuses")
+    .addItem("💾  Refresh Storage Status",                "showStorageStatus")
+    .addItem("🧹  Clear Completed Rows",                  "clearCompletedRows")
+    .addToUi();
+}
+
+// ─────────────────────────────────────────────
+// 1. SETUP SHEET — Table with multiple rows
+// ─────────────────────────────────────────────
+function setupSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── Main Sheet ──
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(SHEET_NAME);
+  sheet.clearContents();
+  sheet.clearFormats();
+
+  // Title banner
+  sheet.getRange("A1:H1").merge()
+    .setValue("🔄  Google Drive Bulk Ownership Transfer  (Admin Tool)")
+    .setBackground("#1a73e8")
+    .setFontColor("white")
+    .setFontWeight("bold")
+    .setFontSize(14)
+    .setHorizontalAlignment("center");
+  sheet.setRowHeight(1, 44);
+
+  // Instructions row
+  sheet.getRange("A2:H2").merge()
+    .setValue("📋  Fill FROM and TO emails below. Add as many rows as needed. Then run: 🚀 Admin Transfer → Transfer All (Bulk)")
+    .setBackground("#e8f0fe")
+    .setFontColor("#1a73e8")
+    .setFontSize(10)
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+  sheet.setRowHeight(2, 28);
+
+  // ── Column Headers (Row 3) ──
+  const headers = [
+    "No.",
+    "FROM Email (Old Owner)",
+    "TO Email (New Owner)",
+    "Validate Status",
+    "Transfer Status",
+    "Transfer ID",
+    "Initiated At (IST)",
+    "Notes"
+  ];
+  sheet.getRange(3, 1, 1, headers.length)
+    .setValues([headers])
+    .setBackground("#1a73e8")
+    .setFontColor("white")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+  sheet.setRowHeight(3, 34);
+  sheet.setFrozenRows(3);
+
+  // Column widths
+  sheet.setColumnWidth(1, 50);   // No.
+  sheet.setColumnWidth(2, 240);  // FROM
+  sheet.setColumnWidth(3, 240);  // TO
+  sheet.setColumnWidth(4, 130);  // Validate
+  sheet.setColumnWidth(5, 130);  // Transfer Status
+  sheet.setColumnWidth(6, 220);  // Transfer ID
+  sheet.setColumnWidth(7, 175);  // Time
+  sheet.setColumnWidth(8, 300);  // Notes
+
+  // ── Pre-fill 5 sample rows ──
+  for (let i = 1; i <= 5; i++) {
+    const r = 3 + i;
+    sheet.getRange(r, 1).setValue(i).setHorizontalAlignment("center").setFontColor("#999");
+    sheet.getRange(r, 2).setValue("oldowner" + i + "@yourdomain.com").setFontColor("#aaa").setFontStyle("italic");
+    sheet.getRange(r, 3).setValue("newowner" + i + "@yourdomain.com").setFontColor("#aaa").setFontStyle("italic");
+    sheet.getRange(r, 4).setValue("PENDING").setHorizontalAlignment("center").setBackground("#f1f3f4");
+    sheet.getRange(r, 5).setValue("PENDING").setHorizontalAlignment("center").setBackground("#f1f3f4");
+    sheet.setRowHeight(r, 28);
+  }
+
+  // ── Log Sheet ──
+  let log = ss.getSheetByName(LOG_SHEET);
+  if (!log) log = ss.insertSheet(LOG_SHEET);
+  log.clearContents();
+  log.getRange(1, 1, 1, 7)
+    .setValues([["Timestamp (IST)", "Row #", "Transfer ID", "From User", "To User", "Status", "Details"]])
+    .setBackground("#1a73e8")
+    .setFontColor("white")
+    .setFontWeight("bold");
+  log.setFrozenRows(1);
+  [180, 60, 220, 230, 230, 120, 340].forEach((w, i) => log.setColumnWidth(i + 1, w));
+
+  showStorageStatus();
+
+  SpreadsheetApp.getUi().alert(
+    "✅ Sheet is ready!\n\n" +
+    "How to use:\n" +
+    "1️⃣  Column B → Enter each FROM (old owner) email\n" +
+    "2️⃣  Column C → Enter each TO (new owner) email\n" +
+    "3️⃣  Add as many rows as needed\n" +
+    "4️⃣  Menu → 🔍 Validate All Users\n" +
+    "5️⃣  Menu → 🔄 Transfer All (Bulk)\n\n" +
+    "💡 To transfer just one row: click that row → Transfer Selected Row Only\n\n" +
+    "⚠️  You must be a Google Workspace Super Admin.\n" +
+    "⚠️  Both users must be in your Workspace domain."
+  );
+}
+
+// ─────────────────────────────────────────────
+// 2. VALIDATE ALL USERS IN THE TABLE
+// ─────────────────────────────────────────────
+function validateAllUsers() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { SpreadsheetApp.getUi().alert("⚠️ Run Setup Sheet first."); return; }
+
+  const rows    = getDataRows(sheet);
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("⚠️ No rows found. Add FROM/TO emails first."); return; }
+
+  let okCount   = 0;
+  let failCount = 0;
+
+  rows.forEach(function(row) {
+    const fromUser = row.from;
+    const toUser   = row.to;
+    const r        = row.rowNum;
+    let issues     = [];
+
+    // Validate FROM
+    try {
+      const u = AdminDirectory.Users.get(fromUser);
+      if (u.suspended) issues.push("FROM suspended");
+    } catch(e) {
+      issues.push("FROM not found");
+    }
+
+    // Validate TO
+    try {
+      const u = AdminDirectory.Users.get(toUser);
+      if (u.suspended) issues.push("TO suspended");
+    } catch(e) {
+      issues.push("TO not found");
+    }
+
+    if (issues.length === 0) {
+      sheet.getRange(r, 4).setValue("✅ Valid").setBackground("#d9ead3").setFontColor("#000").setHorizontalAlignment("center");
+      okCount++;
+    } else {
+      sheet.getRange(r, 4).setValue("❌ " + issues.join(", ")).setBackground("#f4cccc").setFontColor("#000").setHorizontalAlignment("center");
+      failCount++;
+    }
+  });
+
+  SpreadsheetApp.getUi().alert(
+    "🔍 Validation Complete!\n\n" +
+    "✅ Valid:  " + okCount   + " row(s)\n" +
+    "❌ Issues: " + failCount + " row(s)\n\n" +
+    (failCount > 0 ? "Fix the ❌ rows before transferring." : "All good! Run Transfer All (Bulk).")
+  );
+}
+
+// ─────────────────────────────────────────────
+// 3. TRANSFER ALL ROWS (Bulk)
+// ─────────────────────────────────────────────
+function transferAllRows() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet    = ss.getSheetByName(SHEET_NAME);
+  const logSheet = ss.getSheetByName(LOG_SHEET);
+  if (!sheet) { SpreadsheetApp.getUi().alert("⚠️ Run Setup Sheet first."); return; }
+
+  const rows = getDataRows(sheet);
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("⚠️ No rows found."); return; }
+
+  // Filter: skip already completed rows
+  const pending = rows.filter(function(r) {
+    const st = String(r.transferStatus).toUpperCase();
+    return st !== "COMPLETED" && st !== "SUCCESS";
+  });
+
+  if (pending.length === 0) {
+    SpreadsheetApp.getUi().alert("✅ All rows are already completed. Nothing to transfer.");
+    return;
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const confirm = ui.alert(
+    "⚠️ Confirm Bulk Transfer",
+    "This will transfer Google Drive ownership for " + pending.length + " user(s).\n\n" +
+    pending.map(function(r, i) { return (i+1) + ". " + r.from + " → " + r.to; }).join("\n") + "\n\n" +
+    "This cannot be undone. Proceed?",
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  let successCount = 0;
+  let failCount    = 0;
+
+  pending.forEach(function(row) {
+    const result = doTransfer(row.from, row.to);
+    const r      = row.rowNum;
+    const nowIST = getISTTime();
+
+    if (result.success) {
+      sheet.getRange(r, 5).setValue("⏳ inProgress").setBackground("#fff2cc").setHorizontalAlignment("center");
+      sheet.getRange(r, 6).setValue(result.transferId);
+      sheet.getRange(r, 7).setValue(nowIST);
+      sheet.getRange(r, 8).setValue("✅ Submitted. Processing in background (up to 36 hrs).");
+      logSheet.appendRow([nowIST, row.rowNum - 3, result.transferId, row.from, row.to, "inProgress", "Bulk transfer submitted"]);
+      successCount++;
+    } else {
+      sheet.getRange(r, 5).setValue("❌ FAILED").setBackground("#f4cccc").setHorizontalAlignment("center");
+      sheet.getRange(r, 6).setValue("");
+      sheet.getRange(r, 7).setValue(nowIST);
+      sheet.getRange(r, 8).setValue("❌ Error: " + result.error);
+      logSheet.appendRow([nowIST, row.rowNum - 3, "N/A", row.from, row.to, "FAILED", result.error]);
+      failCount++;
+    }
+
+    Utilities.sleep(500); // Avoid quota limits
+  });
+
+  showStorageStatus();
+
+  SpreadsheetApp.getUi().alert(
+    "🚀 Bulk Transfer Complete!\n\n" +
+    "✅ Submitted: " + successCount + "\n" +
+    "❌ Failed:    " + failCount    + "\n\n" +
+    "📧 Users will receive confirmation emails.\n" +
+    "⏱ Large drives may take up to 36 hours.\n\n" +
+    "➡ Track: Menu → 📋 Check All Transfer Statuses"
+  );
+}
+
+// ─────────────────────────────────────────────
+// 4. TRANSFER SELECTED ROW ONLY
+// ─────────────────────────────────────────────
+function transferSelectedRow() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet    = ss.getSheetByName(SHEET_NAME);
+  const logSheet = ss.getSheetByName(LOG_SHEET);
+  if (!sheet) { SpreadsheetApp.getUi().alert("⚠️ Run Setup Sheet first."); return; }
+
+  const selectedRow = sheet.getActiveRange().getRow();
+  if (selectedRow <= 3) {
+    SpreadsheetApp.getUi().alert("⚠️ Please click on a data row (row 4 or below) first, then run this."); return;
+  }
+
+  const fromUser = sheet.getRange(selectedRow, 2).getValue().toString().trim();
+  const toUser   = sheet.getRange(selectedRow, 3).getValue().toString().trim();
+
+  if (!fromUser || !toUser || fromUser.includes("yourdomain")) {
+    SpreadsheetApp.getUi().alert("⚠️ FROM and TO emails are empty or not filled in row " + selectedRow + "."); return;
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const confirm = ui.alert(
+    "⚠️ Confirm Transfer — Row " + (selectedRow - 3),
+    "Transfer Google Drive ownership:\n\nFROM: " + fromUser + "\nTO:   " + toUser + "\n\nProceed?",
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  const result = doTransfer(fromUser, toUser);
+  const nowIST = getISTTime();
+
+  if (result.success) {
+    sheet.getRange(selectedRow, 5).setValue("⏳ inProgress").setBackground("#fff2cc").setHorizontalAlignment("center");
+    sheet.getRange(selectedRow, 6).setValue(result.transferId);
+    sheet.getRange(selectedRow, 7).setValue(nowIST);
+    sheet.getRange(selectedRow, 8).setValue("✅ Submitted. Processing in background (up to 36 hrs).");
+    logSheet.appendRow([nowIST, selectedRow - 3, result.transferId, fromUser, toUser, "inProgress", "Single row transfer"]);
+    SpreadsheetApp.getUi().alert("✅ Transfer submitted!\n\nTransfer ID: " + result.transferId + "\n\nCheck status via Menu → 📋 Check All Transfer Statuses");
+  } else {
+    sheet.getRange(selectedRow, 5).setValue("❌ FAILED").setBackground("#f4cccc").setHorizontalAlignment("center");
+    sheet.getRange(selectedRow, 8).setValue("❌ Error: " + result.error);
+    logSheet.appendRow([nowIST, selectedRow - 3, "N/A", fromUser, toUser, "FAILED", result.error]);
+    SpreadsheetApp.getUi().alert("❌ Transfer Failed\n\nError: " + result.error);
+  }
+}
+
+// ─────────────────────────────────────────────
+// 5. CHECK ALL TRANSFER STATUSES
+// ─────────────────────────────────────────────
+function checkAllStatuses() {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) { SpreadsheetApp.getUi().alert("Run Setup first."); return; }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 4) { SpreadsheetApp.getUi().alert("No transfers found yet."); return; }
+
+  const token = ScriptApp.getOAuthToken();
+  let updated = 0;
+
+  for (let i = 4; i <= lastRow; i++) {
+    const transferId    = sheet.getRange(i, 6).getValue().toString().trim();
+    const currentStatus = sheet.getRange(i, 5).getValue().toString().toLowerCase();
+    if (!transferId || currentStatus === "completed" || currentStatus === "✅ completed") continue;
+
+    try {
+      const response = UrlFetchApp.fetch(
+        "https://admin.googleapis.com/admin/datatransfer/v1/transfers/" + transferId,
+        {
+          method: "GET",
+          headers: { "Authorization": "Bearer " + token },
+          muteHttpExceptions: true
+        }
+      );
+
+      const result = JSON.parse(response.getContentText());
+      const status = result.overallTransferStatusCode || "unknown";
+      const nowIST = getISTTime();
+
+      // Status label
+      let label = status;
+      if (status === "completed")  label = "✅ Completed";
+      if (status === "inProgress") label = "⏳ inProgress";
+      if (status === "failed")     label = "❌ Failed";
+
+      sheet.getRange(i, 5).setValue(label).setHorizontalAlignment("center");
+      sheet.getRange(i, 8).setValue("Last checked: " + nowIST);
+
+      // Color by status
+      const cell = sheet.getRange(i, 5);
+      if      (status === "completed")  cell.setBackground("#d9ead3"); // Green
+      else if (status === "failed")     cell.setBackground("#f4cccc"); // Red
+      else                              cell.setBackground("#fff2cc"); // Yellow
+
+      updated++;
+    } catch(e) {
+      sheet.getRange(i, 8).setValue("Status check error: " + e.message);
+    }
+  }
+
+  SpreadsheetApp.getUi().alert("✅ Status refreshed for " + updated + " transfer(s).");
+}
+
+// ─────────────────────────────────────────────
+// 6. CLEAR COMPLETED ROWS
+// ─────────────────────────────────────────────
+function clearCompletedRows() {
+  const sheet   = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 4) { SpreadsheetApp.getUi().alert("No rows to clear."); return; }
+
+  const ui = SpreadsheetApp.getUi();
+  const confirm = ui.alert("🧹 Clear Completed Rows", "Remove all rows marked as ✅ Completed?", ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) return;
+
+  let removed = 0;
+  for (let i = lastRow; i >= 4; i--) {
+    const status = sheet.getRange(i, 5).getValue().toString().toLowerCase();
+    if (status.includes("completed")) {
+      sheet.deleteRow(i);
+      removed++;
+    }
+  }
+
+  // Re-number remaining rows
+  renumberRows(sheet);
+  SpreadsheetApp.getUi().alert("🧹 Removed " + removed + " completed row(s).");
+}
+
+// ─────────────────────────────────────────────
+// CORE: doTransfer — calls Admin Data Transfer API
+// ─────────────────────────────────────────────
+function doTransfer(fromUser, toUser) {
+  try {
+    // Get user IDs
+    const fromUserObj = AdminDirectory.Users.get(fromUser);
+    const toUserObj   = AdminDirectory.Users.get(toUser);
+    const fromUserId  = fromUserObj.id;
+    const toUserId    = toUserObj.id;
+
+    const token = ScriptApp.getOAuthToken();
+
+    const payload = {
+      oldOwnerUserId: fromUserId,
+      newOwnerUserId: toUserId,
+      applicationDataTransfers: [
+        {
+          applicationId: DRIVE_APP_ID,
+          applicationTransferParams: [
+            { key: "PRIVACY_LEVEL", value: ["PRIVATE", "SHARED"] }
+          ]
+        }
+      ]
+    };
+
+    const response = UrlFetchApp.fetch(
+      "https://admin.googleapis.com/admin/datatransfer/v1/transfers",
+      {
+        method: "POST",
+        contentType: "application/json",
+        headers: { "Authorization": "Bearer " + token },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      }
+    );
+
+    const httpCode = response.getResponseCode();
+    const result   = JSON.parse(response.getContentText());
+
+    if (httpCode !== 200) {
+      const errMsg = result.error ? result.error.message : response.getContentText();
+      return { success: false, error: "API Error " + httpCode + ": " + errMsg };
+    }
+
+    return { success: true, transferId: result.id, status: result.overallTransferStatusCode };
+
+  } catch(e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// HELPER: Get data rows (skip header & empty rows)
+// ─────────────────────────────────────────────
+function getDataRows(sheet) {
+  const lastRow = sheet.getLastRow();
+  const rows    = [];
+  for (let i = 4; i <= lastRow; i++) {
+    const fromUser = sheet.getRange(i, 2).getValue().toString().trim();
+    const toUser   = sheet.getRange(i, 3).getValue().toString().trim();
+    if (!fromUser || !toUser || fromUser.includes("yourdomain")) continue;
+    rows.push({
+      rowNum:          i,
+      from:            fromUser,
+      to:              toUser,
+      transferStatus:  sheet.getRange(i, 5).getValue().toString().trim()
+    });
+  }
+  return rows;
+}
+
+// ─────────────────────────────────────────────
+// HELPER: Re-number rows after deletion
+// ─────────────────────────────────────────────
+function renumberRows(sheet) {
+  const lastRow = sheet.getLastRow();
+  for (let i = 4; i <= lastRow; i++) {
+    sheet.getRange(i, 1).setValue(i - 3).setHorizontalAlignment("center").setFontColor("#999");
+  }
+}
+
+// ─────────────────────────────────────────────
+// STORAGE STATUS
+// ─────────────────────────────────────────────
+function showStorageStatus() {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAME);
+    if (!sheet) return;
+
+    const about      = Drive.About.get({ fields: "storageQuota" });
+    const quota      = about.storageQuota;
+    const totalBytes = parseInt(quota.limit || 0);
+    const usedBytes  = parseInt(quota.usage || 0);
+    const freeBytes  = totalBytes - usedBytes;
+    const usedPct    = totalBytes > 0 ? ((usedBytes / totalBytes) * 100).toFixed(1) : "N/A";
+    const freePct    = totalBytes > 0 ? (freeBytes / totalBytes) * 100 : 100;
+
+    const col = 10; // Column J
+
+    sheet.getRange(1, col, 1, 2).merge()
+      .setValue("💾 STORAGE STATUS")
+      .setBackground("#FF6D00")
+      .setFontColor("white")
+      .setFontWeight("bold")
+      .setHorizontalAlignment("center");
+
+    const rows = [
+      ["Total:",   formatBytes(totalBytes)],
+      ["Used:",    formatBytes(usedBytes) + "  (" + usedPct + "%)"],
+      ["Free:",    formatBytes(freeBytes)],
+      ["Updated:", getISTTime()]
+    ];
+
+    rows.forEach(function(r, i) {
+      sheet.getRange(i + 2, col).setValue(r[0]).setFontWeight("bold").setBackground("#f1f3f4");
+      sheet.getRange(i + 2, col + 1).setValue(r[1]);
+    });
+
+    sheet.getRange(4, col + 1)
+      .setBackground(freePct < 10 ? "#f4cccc" : freePct < 25 ? "#fce5cd" : "#d9ead3");
+
+    sheet.setColumnWidth(col,     140);
+    sheet.setColumnWidth(col + 1, 180);
+
+  } catch(e) {
+    Logger.log("Storage status error: " + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+function getISTTime() {
+  return Utilities.formatDate(new Date(), "Asia/Kolkata", "dd-MMM-yyyy hh:mm:ss a");
+}
+
+function formatBytes(bytes) {
+  bytes = parseInt(bytes) || 0;
+  if (bytes === 0)        return "0 B";
+  if (bytes < 1024)       return bytes + " B";
+  if (bytes < 1048576)    return (bytes / 1024).toFixed(2)       + " KB";
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(2)    + " MB";
+  return                         (bytes / 1073741824).toFixed(2)  + " GB";
+}
